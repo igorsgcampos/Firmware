@@ -117,10 +117,11 @@ private:
 
 	sensor_combined_s _sensor_combined{};
 
-	uORB::SubscriptionCallbackWorkItem _vehicle_imu_sub[3] {
+	uORB::SubscriptionCallbackWorkItem _vehicle_imu_sub[MAX_SENSOR_COUNT] {
 		{this, ORB_ID(vehicle_imu), 0},
 		{this, ORB_ID(vehicle_imu), 1},
-		{this, ORB_ID(vehicle_imu), 2}
+		{this, ORB_ID(vehicle_imu), 2},
+		{this, ORB_ID(vehicle_imu), 3}
 	};
 
 	uORB::Subscription _diff_pres_sub{ORB_ID(differential_pressure)};
@@ -175,9 +176,9 @@ private:
 	VehicleMagnetometer     *_vehicle_magnetometer{nullptr};
 	VehicleGPSPosition	*_vehicle_gps_position{nullptr};
 
-	static constexpr int MAX_SENSOR_COUNT = 3;
 	VehicleIMU      *_vehicle_imu_list[MAX_SENSOR_COUNT] {};
 
+	int _lockstep_component{-1};
 
 	/**
 	 * Update our local parameter cache.
@@ -245,6 +246,7 @@ Sensors::Sensors(bool hil_enabled) :
 	param_find("SENS_BOARD_Y_OFF");
 	param_find("SENS_BOARD_Z_OFF");
 
+	param_find("SYS_FAC_CAL_MODE");
 	param_find("SYS_PARAM_VER");
 	param_find("SYS_AUTOSTART");
 	param_find("SYS_AUTOCONFIG");
@@ -296,6 +298,8 @@ Sensors::~Sensors()
 	}
 
 	perf_free(_loop_perf);
+
+	px4_lockstep_unregister_component(_lockstep_component);
 }
 
 bool Sensors::init()
@@ -388,8 +392,8 @@ void Sensors::diff_pres_poll()
 						  diff_pres.differential_pressure_filtered_pa, air_data.baro_pressure_pa,
 						  air_temperature_celsius);
 
-		airspeed.true_airspeed_m_s = calc_TAS_from_EAS(airspeed.indicated_airspeed_m_s, air_data.baro_pressure_pa,
-					     air_temperature_celsius); // assume that EAS = IAS as we don't have an EAS-scale here
+		airspeed.true_airspeed_m_s = calc_TAS_from_CAS(airspeed.indicated_airspeed_m_s, air_data.baro_pressure_pa,
+					     air_temperature_celsius); // assume that CAS = IAS as we don't have an CAS-scale here
 
 		airspeed.air_temperature_celsius = air_temperature_celsius;
 
@@ -535,7 +539,8 @@ void Sensors::InitializeVehicleIMU()
 			if (accel.device_id > 0 && gyro.device_id > 0) {
 				// if the sensors module is responsible for voting (SENS_IMU_MODE 1) then run every VehicleIMU in the same WQ
 				//   otherwise each VehicleIMU runs in a corresponding INSx WQ
-				const px4::wq_config_t &wq_config = px4::wq_configurations::nav_and_controllers;
+				const bool multi_mode = (_param_sens_imu_mode.get() == 0);
+				const px4::wq_config_t &wq_config = multi_mode ? px4::ins_instance_to_wq(i) : px4::wq_configurations::INS0;
 
 				VehicleIMU *imu = new VehicleIMU(i, i, i, wq_config);
 
@@ -636,6 +641,12 @@ void Sensors::Run()
 		// check parameters for updates
 		parameter_update_poll();
 	}
+
+	if (_lockstep_component == -1) {
+		_lockstep_component = px4_lockstep_register_component();
+	}
+
+	px4_lockstep_progress(_lockstep_component);
 
 	perf_end(_loop_perf);
 }

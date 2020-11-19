@@ -41,6 +41,7 @@
 #include "commander_helper.h"
 #include "calibration_routines.h"
 #include "calibration_messages.h"
+#include "factory_calibration_storage.h"
 
 #include <px4_platform_common/defines.h>
 #include <px4_platform_common/posix.h>
@@ -255,7 +256,7 @@ static calibrate_return mag_calibration_worker(detect_orientation_return orienta
 	float mag_sphere_radius = get_sphere_radius();
 
 	// notify user to start rotating
-	set_tune(TONE_SINGLE_BEEP_TUNE);
+	set_tune(tune_control_s::TUNE_ID_SINGLE_BEEP);
 
 	calibration_log_info(worker_data->mavlink_log_pub, "[cal] Rotate vehicle");
 
@@ -679,7 +680,7 @@ calibrate_return mag_calibrate_all(orb_advert_t *mavlink_log_pub, int32_t cal_ma
 			// only proceed if there's a valid internal
 			if (internal_index >= 0) {
 
-				const Dcmf board_rotation = calibration::GetBoardRotation();
+				const Dcmf board_rotation = calibration::GetBoardRotationMatrix();
 
 				// apply new calibrations to all raw sensor data before comparison
 				for (unsigned cur_mag = 0; cur_mag < MAX_MAGS; cur_mag++) {
@@ -852,6 +853,13 @@ calibrate_return mag_calibrate_all(orb_advert_t *mavlink_log_pub, int32_t cal_ma
 		free(worker_data.z[cur_mag]);
 	}
 
+	FactoryCalibrationStorage factory_storage;
+
+	if (result == calibrate_return_ok && factory_storage.open() != PX4_OK) {
+		calibration_log_critical(mavlink_log_pub, "ERROR: cannot open calibration storage");
+		result = calibrate_return_error;
+	}
+
 	if (result == calibrate_return_ok) {
 		bool param_save = false;
 		bool failed = true;
@@ -891,6 +899,10 @@ calibrate_return mag_calibrate_all(orb_advert_t *mavlink_log_pub, int32_t cal_ma
 				calibration_log_critical(mavlink_log_pub, "calibration save failed");
 				break;
 			}
+		}
+
+		if (!failed && factory_storage.store() != PX4_OK) {
+			failed = true;
 		}
 
 		if (param_save) {
@@ -960,6 +972,13 @@ int do_mag_calibration_quick(orb_advert_t *mavlink_log_pub, float heading_radian
 			return PX4_ERROR;
 		}
 
+		FactoryCalibrationStorage factory_storage;
+
+		if (factory_storage.open() != PX4_OK) {
+			calibration_log_critical(mavlink_log_pub, "ERROR: cannot open calibration storage");
+			return PX4_ERROR;
+		}
+
 		calibration_log_critical(mavlink_log_pub, "Assuming vehicle is facing heading %.1f degrees",
 					 (double)math::radians(heading_radians));
 
@@ -1003,6 +1022,10 @@ int do_mag_calibration_quick(orb_advert_t *mavlink_log_pub, float heading_radian
 
 		if (param_save) {
 			param_notify_changes();
+		}
+
+		if (!failed && factory_storage.store() != PX4_OK) {
+			failed = true;
 		}
 
 		if (!failed) {

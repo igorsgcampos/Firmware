@@ -39,8 +39,12 @@
  */
 
 #pragma once
+
+#include "EKF2Selector.hpp"
+
 #include <float.h>
 
+#include <containers/LockGuard.hpp>
 #include <drivers/drv_hrt.h>
 #include <lib/ecl/EKF/ekf.h>
 #include <lib/mathlib/mathlib.h>
@@ -61,6 +65,7 @@
 #include <uORB/topics/ekf2_timestamps.h>
 #include <uORB/topics/ekf_gps_drift.h>
 #include <uORB/topics/estimator_innovations.h>
+#include <uORB/topics/estimator_optical_flow_vel.h>
 #include <uORB/topics/estimator_sensor_bias.h>
 #include <uORB/topics/estimator_states.h>
 #include <uORB/topics/estimator_status.h>
@@ -84,10 +89,13 @@
 
 #include "Utility/PreFlightChecker.hpp"
 
-class EKF2 final : public ModuleBase<EKF2>, public ModuleParams, public px4::ScheduledWorkItem
+extern pthread_mutex_t ekf2_module_mutex;
+
+class EKF2 final : public ModuleParams, public px4::ScheduledWorkItem
 {
 public:
-	explicit EKF2(bool replay_mode = false);
+	EKF2() = delete;
+	EKF2(int instance, const px4::wq_config_t &config, int imu, int mag, bool replay_mode);
 	~EKF2() override;
 
 	/** @see ModuleBase */
@@ -99,48 +107,69 @@ public:
 	/** @see ModuleBase */
 	static int print_usage(const char *reason = nullptr);
 
-	bool init();
+	int print_status();
 
-	int print_status() override;
+	bool should_exit() const { return _task_should_exit.load(); }
+
+	void request_stop() { _task_should_exit.store(true); }
+
+	static void lock_module() { pthread_mutex_lock(&ekf2_module_mutex); }
+	static bool trylock_module() { return (pthread_mutex_trylock(&ekf2_module_mutex) == 0); }
+	static void unlock_module() { pthread_mutex_unlock(&ekf2_module_mutex); }
 
 private:
 	void Run() override;
 
-	int getRangeSubIndex(); ///< get subscription index of first downward-facing range sensor
-	void fillGpsMsgWithVehicleGpsPosData(gps_message &msg, const vehicle_gps_position_s &data);
-
-	PreFlightChecker _preflt_checker;
-	void runPreFlightChecks(float dt, const filter_control_status_u &control_status,
-				const vehicle_status_s &vehicle_status,
-				const estimator_innovations_s &innov);
-	void resetPreFlightChecks();
-
 	template<typename Param>
 	void update_mag_bias(Param &mag_bias_param, int axis_index);
 
-	template<typename Param>
-	bool update_mag_decl(Param &mag_decl_param);
+	void PublishAttitude(const hrt_abstime &timestamp);
+	void PublishEkfDriftMetrics(const hrt_abstime &timestamp);
+	void PublishGlobalPosition(const hrt_abstime &timestamp);
+	void PublishInnovations(const hrt_abstime &timestamp, const imuSample &imu);
+	void PublishInnovationTestRatios(const hrt_abstime &timestamp);
+	void PublishInnovationVariances(const hrt_abstime &timestamp);
+	void PublishLocalPosition(const hrt_abstime &timestamp);
+	void PublishOdometry(const hrt_abstime &timestamp, const imuSample &imu);
+	void PublishOdometryAligned(const hrt_abstime &timestamp, const vehicle_odometry_s &ev_odom);
+	void PublishOpticalFlowVel(const hrt_abstime &timestamp, const optical_flow_s &optical_flow);
+	void PublishSensorBias(const hrt_abstime &timestamp);
+	void PublishStates(const hrt_abstime &timestamp);
+	void PublishStatus(const hrt_abstime &timestamp);
+	void PublishWindEstimate(const hrt_abstime &timestamp);
+	void PublishYawEstimatorStatus(const hrt_abstime &timestamp);
 
-	void publish_attitude(const hrt_abstime &timestamp);
-	void publish_odometry(const hrt_abstime &timestamp, const imuSample &imu, const vehicle_local_position_s &lpos);
-	void publish_wind_estimate(const hrt_abstime &timestamp);
-	void publish_yaw_estimator_status(const hrt_abstime &timestamp);
+	void UpdateAirspeedSample(ekf2_timestamps_s &ekf2_timestamps);
+	void UpdateAuxVelSample(ekf2_timestamps_s &ekf2_timestamps);
+	void UpdateBaroSample(ekf2_timestamps_s &ekf2_timestamps);
+	bool UpdateExtVisionSample(ekf2_timestamps_s &ekf2_timestamps, vehicle_odometry_s &ev_odom);
+	bool UpdateFlowSample(ekf2_timestamps_s &ekf2_timestamps, optical_flow_s &optical_flow);
+	void UpdateGpsSample(ekf2_timestamps_s &ekf2_timestamps);
+	void UpdateMagSample(ekf2_timestamps_s &ekf2_timestamps);
+	void UpdateRangeSample(ekf2_timestamps_s &ekf2_timestamps);
+
+	void UpdateMagCalibration(const hrt_abstime &timestamp);
 
 	/*
 	 * Calculate filtered WGS84 height from estimated AMSL height
 	 */
 	float filter_altitude_ellipsoid(float amsl_hgt);
 
-	inline float sq(float x) { return x * x; };
+	static constexpr float sq(float x) { return x * x; };
 
-	const bool 	_replay_mode;			///< true when we use replay data from a log
+	const bool _replay_mode{false};			///< true when we use replay data from a log
+	const bool _multi_mode;
+	const int _instance;
+
+	px4::atomic_bool _task_should_exit{false};
 
 	// time slip monitoring
 	uint64_t _integrated_time_us = 0;	///< integral of gyro delta time from start (uSec)
 	uint64_t _start_time_us = 0;		///< system time at EKF start (uSec)
 	int64_t _last_time_slip_us = 0;		///< Last time slip (uSec)
 
-	perf_counter_t _ekf_update_perf;
+	perf_counter_t _ecl_ekf_update_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": ECL update")};
+	perf_counter_t _ecl_ekf_update_full_perf{perf_alloc(PC_ELAPSED, MODULE_NAME": ECL full update")};
 
 	// Initialise time stamps used to send sensor data to the EKF and for logging
 	uint8_t _invalid_mag_id_count = 0;	///< number of times an invalid magnetomer device ID has been detected
@@ -149,9 +178,9 @@ private:
 	hrt_abstime _last_magcal_us = 0;	///< last time the EKF was operating a mode that estimates magnetomer biases (uSec)
 	hrt_abstime _total_cal_time_us = 0;	///< accumulated calibration time since the last save
 
-	float _last_valid_mag_cal[3] = {};	///< last valid XYZ magnetometer bias estimates (mGauss)
-	bool _valid_cal_available[3] = {};	///< true when an unsaved valid calibration for the XYZ magnetometer bias is available
-	float _last_valid_variance[3] = {};	///< variances for the last valid magnetometer XYZ bias estimates (mGauss**2)
+	float _last_valid_mag_cal[3] = {};	///< last valid XYZ magnetometer bias estimates (Gauss)
+	float _last_valid_variance[3] = {};	///< variances for the last valid magnetometer XYZ bias estimates (Gauss**2)
+	bool _valid_cal_available{false};	///< true when an unsaved valid calibration for the XYZ magnetometer bias is available
 
 	// Used to control saving of mag declination to be used on next startup
 	bool _mag_decl_saved = false;	///< true when the magnetic declination has been saved
@@ -165,12 +194,20 @@ private:
 
 	bool _imu_bias_reset_request{false};
 
-	// republished aligned external visual odometry
-	bool new_ev_data_received = false;
-	vehicle_odometry_s _ev_odom{};
+	uint32_t _device_id_accel{0};
+	uint32_t _device_id_baro{0};
+	uint32_t _device_id_gyro{0};
+	uint32_t _device_id_mag{0};
+
+	Vector3f _last_local_position_for_gpos{};
+
+	Vector3f _last_accel_bias{};
+	Vector3f _last_gyro_bias{};
+	Vector3f _last_mag_bias{};
 
 	uORB::Subscription _airdata_sub{ORB_ID(vehicle_air_data)};
 	uORB::Subscription _airspeed_sub{ORB_ID(airspeed)};
+	uORB::Subscription _distance_sensor_sub{ORB_ID(distance_sensor)};
 	uORB::Subscription _ev_odom_sub{ORB_ID(vehicle_visual_odometry)};
 	uORB::Subscription _landing_target_pose_sub{ORB_ID(landing_target_pose)};
 	uORB::Subscription _magnetometer_sub{ORB_ID(vehicle_magnetometer)};
@@ -182,35 +219,35 @@ private:
 	uORB::Subscription _vehicle_land_detected_sub{ORB_ID(vehicle_land_detected)};
 
 	uORB::SubscriptionCallbackWorkItem _sensor_combined_sub{this, ORB_ID(sensor_combined)};
-	static constexpr int MAX_SENSOR_COUNT = 3;
 	uORB::SubscriptionCallbackWorkItem _vehicle_imu_sub{this, ORB_ID(vehicle_imu)};
-	int _imu_sub_index{-1};
+
 	bool _callback_registered{false};
 	int _lockstep_component{-1};
 
-	// because we can have several distance sensor instances with different orientations
-	uORB::SubscriptionMultiArray<distance_sensor_s> _distance_sensor_subs{ORB_ID::distance_sensor};
-	int _range_finder_sub_index = -1; // index for downward-facing range finder subscription
+	bool _distance_sensor_selected{false}; // because we can have several distance sensor instances with different orientations
+	bool _armed{false};
+	bool _standby{false}; // standby arming state
 
-	sensor_selection_s		_sensor_selection{};
-	vehicle_land_detected_s		_vehicle_land_detected{};
-	vehicle_status_s		_vehicle_status{};
+	uORB::PublicationMulti<ekf2_timestamps_s>            _ekf2_timestamps_pub{ORB_ID(ekf2_timestamps)};
+	uORB::PublicationMulti<ekf_gps_drift_s>              _ekf_gps_drift_pub{ORB_ID(ekf_gps_drift)};
+	uORB::PublicationMulti<estimator_innovations_s>      _estimator_innovation_test_ratios_pub{ORB_ID(estimator_innovation_test_ratios)};
+	uORB::PublicationMulti<estimator_innovations_s>      _estimator_innovation_variances_pub{ORB_ID(estimator_innovation_variances)};
+	uORB::PublicationMulti<estimator_innovations_s>      _estimator_innovations_pub{ORB_ID(estimator_innovations)};
+	uORB::PublicationMulti<estimator_optical_flow_vel_s> _estimator_optical_flow_vel_pub{ORB_ID(estimator_optical_flow_vel)};
+	uORB::PublicationMulti<estimator_sensor_bias_s>      _estimator_sensor_bias_pub{ORB_ID(estimator_sensor_bias)};
+	uORB::PublicationMulti<estimator_states_s>           _estimator_states_pub{ORB_ID(estimator_states)};
+	uORB::PublicationMulti<estimator_status_s>           _estimator_status_pub{ORB_ID(estimator_status)};
+	uORB::PublicationMulti<vehicle_odometry_s>           _estimator_visual_odometry_aligned_pub{ORB_ID(estimator_visual_odometry_aligned)};
+	uORB::PublicationMulti<yaw_estimator_status_s>       _yaw_est_pub{ORB_ID(yaw_estimator_status)};
+	uORB::PublicationMulti<wind_estimate_s>              _wind_pub{ORB_ID(wind_estimate)};
 
-	uORB::Publication<ekf2_timestamps_s>			_ekf2_timestamps_pub{ORB_ID(ekf2_timestamps)};
-	uORB::Publication<ekf_gps_drift_s>			_ekf_gps_drift_pub{ORB_ID(ekf_gps_drift)};
-	uORB::Publication<estimator_innovations_s>		_estimator_innovation_test_ratios_pub{ORB_ID(estimator_innovation_test_ratios)};
-	uORB::Publication<estimator_innovations_s>		_estimator_innovation_variances_pub{ORB_ID(estimator_innovation_variances)};
-	uORB::Publication<estimator_innovations_s>		_estimator_innovations_pub{ORB_ID(estimator_innovations)};
-	uORB::Publication<estimator_sensor_bias_s>		_estimator_sensor_bias_pub{ORB_ID(estimator_sensor_bias)};
-	uORB::Publication<estimator_states_s>			_estimator_states_pub{ORB_ID(estimator_states)};
-	uORB::PublicationData<estimator_status_s>		_estimator_status_pub{ORB_ID(estimator_status)};
-	uORB::Publication<vehicle_attitude_s>			_att_pub{ORB_ID(vehicle_attitude)};
-	uORB::Publication<vehicle_odometry_s>			_vehicle_odometry_pub{ORB_ID(vehicle_odometry)};
-	uORB::Publication<yaw_estimator_status_s>		_yaw_est_pub{ORB_ID(yaw_estimator_status)};
-	uORB::PublicationData<vehicle_global_position_s>	_vehicle_global_position_pub{ORB_ID(vehicle_global_position)};
-	uORB::PublicationData<vehicle_local_position_s>		_vehicle_local_position_pub{ORB_ID(vehicle_local_position)};
-	uORB::PublicationData<vehicle_odometry_s>		_vehicle_visual_odometry_aligned_pub{ORB_ID(vehicle_visual_odometry_aligned)};
-	uORB::PublicationMulti<wind_estimate_s>			_wind_pub{ORB_ID(wind_estimate)};
+	// publications with topic dependent on multi-mode
+	uORB::PublicationMulti<vehicle_attitude_s>           _attitude_pub;
+	uORB::PublicationMulti<vehicle_local_position_s>     _local_position_pub;
+	uORB::PublicationMulti<vehicle_global_position_s>    _global_position_pub;
+	uORB::PublicationMulti<vehicle_odometry_s>           _odometry_pub;
+
+	PreFlightChecker _preflt_checker;
 
 	Ekf _ekf;
 
@@ -363,8 +400,6 @@ private:
 		(ParamExtFloat<px4::params::EKF2_OF_GATE>)
 		_param_ekf2_of_gate,	///< optical flow fusion innovation consistency gate size (STD)
 
-		(ParamInt<px4::params::EKF2_IMU_ID>) _param_ekf2_imu_id,
-
 		// sensor positions in body frame
 		(ParamExtFloat<px4::params::EKF2_IMU_POS_X>) _param_ekf2_imu_pos_x,		///< X position of IMU in body frame (m)
 		(ParamExtFloat<px4::params::EKF2_IMU_POS_Y>) _param_ekf2_imu_pos_y,		///< Y position of IMU in body frame (m)
@@ -409,13 +444,13 @@ private:
 		_param_ekf2_angerr_init,	///< 1-sigma tilt error after initial alignment using gravity vector (rad)
 
 		// EKF saved XYZ magnetometer bias values
-		(ParamFloat<px4::params::EKF2_MAGBIAS_X>) _param_ekf2_magbias_x,		///< X magnetometer bias (mGauss)
-		(ParamFloat<px4::params::EKF2_MAGBIAS_Y>) _param_ekf2_magbias_y,		///< Y magnetometer bias (mGauss)
-		(ParamFloat<px4::params::EKF2_MAGBIAS_Z>) _param_ekf2_magbias_z,		///< Z magnetometer bias (mGauss)
+		(ParamFloat<px4::params::EKF2_MAGBIAS_X>) _param_ekf2_magbias_x,		///< X magnetometer bias (Gauss)
+		(ParamFloat<px4::params::EKF2_MAGBIAS_Y>) _param_ekf2_magbias_y,		///< Y magnetometer bias (Gauss)
+		(ParamFloat<px4::params::EKF2_MAGBIAS_Z>) _param_ekf2_magbias_z,		///< Z magnetometer bias (Gauss)
 		(ParamInt<px4::params::EKF2_MAGBIAS_ID>)
 		_param_ekf2_magbias_id,		///< ID of the magnetometer sensor used to learn the bias values
 		(ParamFloat<px4::params::EKF2_MAGB_VREF>)
-		_param_ekf2_magb_vref, ///< Assumed error variance of previously saved magnetometer bias estimates (mGauss**2)
+		_param_ekf2_magb_vref, ///< Assumed error variance of previously saved magnetometer bias estimates (Gauss**2)
 		(ParamFloat<px4::params::EKF2_MAGB_K>)
 		_param_ekf2_magb_k,	///< maximum fraction of the learned magnetometer bias that is saved at each disarm
 
